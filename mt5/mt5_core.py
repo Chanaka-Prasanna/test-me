@@ -1,10 +1,9 @@
 """
-MT5 Connection & Core Trading Functions (MetaAPI Cloud)
-Handles MT5 operations via MetaAPI for multi-user support.
+MT5 Connection & Core Trading Functions (Local Terminal)
+Handles MT5 operations via local MetaTrader 5 terminal.
 All functions are async and take a context (ctx) parameter.
 
-The MT5UserContext dataclass holds connection info for a specific user,
-enabling multiple users to trade simultaneously through MetaAPI cloud.
+The MT5UserContext dataclass holds connection info for a specific user.
 """
 import numpy as np
 from dataclasses import dataclass
@@ -24,12 +23,11 @@ from mt5.mt5_config import (
 @dataclass
 class MT5UserContext:
     """
-    Holds MetaAPI connection info for a single user.
-    Each user gets their own context — enabling multi-user trading.
+    Holds local MT5 connection info for a single user.
     """
-    connection: Any           # MetaAPI RpcMetaApiConnection
+    connection: Any           # Local MT5Connection instance
     telegram_id: int          # User's Telegram ID
-    metaapi_account_id: str   # User's MetaAPI account ID
+    metaapi_account_id: str   # Unused (for backward compatibility)
 
 
 # =====================================================
@@ -56,59 +54,70 @@ def _timeframe_to_minutes(timeframe):
 
 
 # =====================================================
-# CONNECTION (delegated to metaapi_manager)
+# LOCAL MT5 CONNECTION MANAGEMENT
 # =====================================================
 
 async def connect_mt5(telegram_id, metaapi_account_id, bot=None):
     """
-    Connect to MT5 via MetaAPI for a specific user.
+    Connect to local MT5 terminal for a specific user.
 
     Args:
         telegram_id: User's Telegram ID
-        metaapi_account_id: User's MetaAPI account ID
+        metaapi_account_id: Unused (for backward compatibility)
         bot: Optional Telegram bot instance for alerts
 
     Returns:
         bool: True if connection successful
     """
-    from mt5.metaapi_manager import get_user_connection
-    connection = await get_user_connection(telegram_id, metaapi_account_id, bot=bot)
-    return connection is not None
+    from mt5.local_mt5_connection import connect_mt5 as local_connect
+    return local_connect()
 
 
 async def disconnect_mt5(telegram_id):
-    """Disconnect user's MetaAPI connection."""
-    from mt5.metaapi_manager import disconnect_user
-    await disconnect_user(telegram_id)
+    """Disconnect user's local MT5 terminal connection."""
+    from mt5.local_mt5_connection import disconnect_mt5 as local_disconnect
+    local_disconnect()
 
 
 async def is_mt5_connected(telegram_id):
-    """Check if user's MetaAPI connection is active."""
-    from mt5.metaapi_manager import is_user_connected
-    return await is_user_connected(telegram_id)
+    """Check if user's local MT5 terminal connection is active."""
+    from mt5.local_mt5_connection import get_mt5_connection
+    conn = get_mt5_connection()
+    return conn.is_connected() if conn else False
 
 
-async def get_connection(telegram_id, metaapi_account_id, bot=None):
-    """Get the MetaAPI RPC connection for a user."""
-    from mt5.metaapi_manager import get_user_connection
-    return await get_user_connection(telegram_id, metaapi_account_id, bot=bot)
+
+async def get_connection(telegram_id, metaapi_account_id=None, bot=None):
+    """Get the local MT5 connection for a user."""
+    from mt5.local_mt5_connection import get_mt5_connection
+    return get_mt5_connection()
 
 
 async def create_user_context(telegram_id, metaapi_account_id, bot=None):
     """
-    Create an MT5UserContext for a user — connects if needed.
+    Create an MT5UserContext for a user — uses LOCAL MT5 terminal connection.
 
     Args:
         telegram_id: User's Telegram ID
-        metaapi_account_id: User's MetaAPI account ID
+        metaapi_account_id: User's MetaAPI account ID (ignored, for compatibility)
         bot: Optional Telegram bot instance for alerts
 
     Returns:
         MT5UserContext or None on failure
     """
-    connection = await get_connection(telegram_id, metaapi_account_id, bot=bot)
-    if connection is None:
-        return None
+    # Use local MT5 connection instead of MetaAPI
+    from mt5.local_mt5_connection import get_mt5_connection
+    
+    connection = get_mt5_connection()
+    if not connection.is_connected():
+        try:
+            if not connection.connect():
+                print(f"[MT5] Failed to connect to local MT5 terminal")
+                return None
+        except Exception as e:
+            print(f"[MT5] Error connecting to MT5: {e}")
+            return None
+    
     return MT5UserContext(
         connection=connection,
         telegram_id=telegram_id,
@@ -117,34 +126,27 @@ async def create_user_context(telegram_id, metaapi_account_id, bot=None):
 
 
 async def _get_account_information_with_retry(ctx, attempts=3, delay_seconds=1.5):
-    """Fetch account info with retry and one connection refresh on timeout."""
+    """Fetch account info with retry (handles both MetaAPI and local MT5 connections)."""
     last_error = None
 
     for attempt in range(1, attempts + 1):
         try:
-            return await ctx.connection.get_account_information()
+            # Call get_account_information() - works with both connection types
+            result = ctx.connection.get_account_information()
+            if result is None and attempt < attempts:
+                await asyncio.sleep(delay_seconds)
+                continue
+            return result
         except Exception as e:
             last_error = e
             print(f"[MT5] Account info request failed (attempt {attempt}/{attempts}): {e}")
 
-            # On the second failed attempt, try refreshing the user's cached connection.
-            if attempt == 2:
-                try:
-                    from mt5.metaapi_manager import get_user_connection
-                    fresh_connection = await get_user_connection(
-                        ctx.telegram_id,
-                        ctx.metaapi_account_id,
-                    )
-                    if fresh_connection is not None and fresh_connection is not ctx.connection:
-                        ctx.connection = fresh_connection
-                        print("[MT5] 🔄 Refreshed MetaAPI connection after account-info timeout")
-                except Exception as refresh_error:
-                    print(f"[MT5] Connection refresh failed: {refresh_error}")
-
             if attempt < attempts:
                 await asyncio.sleep(delay_seconds)
 
-    raise last_error
+    if last_error:
+        raise last_error
+    return None
 
 
 # =====================================================
@@ -215,35 +217,8 @@ async def get_candles(ctx, symbol, timeframe="M15", count=100):
         return None
 
     try:
-        from mt5.metaapi_manager import get_historical_candles
-
-        raw_candles = await get_historical_candles(
-            ctx.telegram_id, ctx.metaapi_account_id, symbol, tf, count
-        )
-
-        if not raw_candles or len(raw_candles) == 0:
-            print(f"[MT5] No candle data for {symbol} {timeframe}")
-            return None
-
-        candles = []
-        for c in raw_candles:
-            time_val = c.get('time')
-            if isinstance(time_val, str):
-                try:
-                    time_val = datetime.fromisoformat(time_val.replace('Z', '+00:00'))
-                except Exception:
-                    time_val = datetime.utcnow()
-            elif time_val is None:
-                time_val = datetime.utcnow()
-
-            candles.append({
-                "time": time_val,
-                "open": float(c.get('open', 0)),
-                "high": float(c.get('high', 0)),
-                "low": float(c.get('low', 0)),
-                "close": float(c.get('close', 0)),
-                "volume": float(c.get('tickVolume', c.get('volume', 0))),
-            })
+        # Use local MT5 terminal connection
+        candles = ctx.connection.get_candles(symbol, timeframe, count)
         return candles
 
     except Exception as e:
@@ -262,12 +237,14 @@ async def get_close_prices(ctx, symbol, timeframe="M15", count=100):
 async def get_current_price(ctx, symbol):
     """
     Get current bid/ask for a symbol.
+    Handles both MetaAPI and local MT5 connections.
 
     Returns:
         tuple: (bid, ask) or (None, None) on error
     """
     try:
-        price = await ctx.connection.get_symbol_price(symbol)
+        # Call without await - works with both connection types
+        price = ctx.connection.get_symbol_price(symbol)
         if price is None:
             print(f"[MT5] Could not get price for {symbol}")
             return None, None
@@ -278,9 +255,13 @@ async def get_current_price(ctx, symbol):
 
 
 async def get_symbol_info(ctx, symbol, silent=False):
-    """Get symbol details (point, digits, trade sizes, etc.)."""
+    """
+    Get symbol details (point, digits, trade sizes, etc.)
+    Handles both MetaAPI and local MT5 connections.
+    """
     try:
-        spec = await ctx.connection.get_symbol_specification(symbol)
+        # Call without await - works with both connection types
+        spec = ctx.connection.get_symbol_specification(symbol)
         if spec is None:
             if not silent:
                 print(f"[MT5] Symbol not found: {symbol}")
@@ -304,17 +285,23 @@ async def get_symbol_info(ctx, symbol, silent=False):
 async def resolve_symbol(ctx, base_symbol):
     """Attempt to find the correct suffix for a base symbol (e.g. XAUUSD -> XAUUSDm)."""
     if "XAUUSD" in base_symbol or "GOLD" in base_symbol:
-        alts = [base_symbol, "XAUUSD", "XAUUSDm", "XAUUSD.a", "XAUUSD.pro", "XAUUSD.c", "GOLD", "GOLDm", "GOLD.a", "XAUUSD_m"]
+        alts = [base_symbol, "GOLD", "GOLDm", "GOLD.a", "XAUUSD", "XAUUSDm", "XAUUSD.a", "XAUUSD.pro", "XAUUSD.c", "XAUUSD_m"]
     else:
         alts = [base_symbol, base_symbol + "m", base_symbol + ".a", base_symbol + ".pro", base_symbol + ".c"]
+    
+    print(f"[MT5-RESOLVE] Resolving symbol: {base_symbol} | Trying alternatives: {alts}")
     
     for alt in alts:
         try:
             spec = await get_symbol_info(ctx, alt, silent=True)
             if spec is not None:
+                print(f"[MT5-RESOLVE] ✅ Found working symbol: {alt}")
                 return alt
-        except Exception:
+        except Exception as e:
+            print(f"[MT5-RESOLVE] ⚠️ {alt} failed: {e}")
             pass
+    
+    print(f"[MT5-RESOLVE] ❌ No working symbol found, defaulting to: {base_symbol}")
     return base_symbol
 
 # =====================================================
@@ -375,29 +362,38 @@ async def open_position(ctx, symbol, direction, lot, sl, tp, comment=""):
             'magic': MAGIC_NUMBER,
         }
 
+        # Handle both async (MetaAPI) and sync (local MT5) connections
         if direction.upper() == "BUY":
-            result = await ctx.connection.create_market_buy_order(
-                symbol, lot, sl, tp, options
+            result = ctx.connection.create_market_buy_order(
+                symbol, lot, sl, tp, comment
             )
         elif direction.upper() == "SELL":
-            result = await ctx.connection.create_market_sell_order(
-                symbol, lot, sl, tp, options
+            result = ctx.connection.create_market_sell_order(
+                symbol, lot, sl, tp, comment
             )
         else:
             print(f"[MT5] Invalid direction: {direction}")
             return None
 
-        if result and result.get('stringCode') == 'TRADE_RETCODE_DONE':
-            order_id = result.get('orderId', result.get('positionId', ''))
-            open_price = result.get('price', 0)
-            print(f"[MT5] ✅ {direction} {lot} {symbol} @ {open_price} | SL: {sl:.5f} TP: {tp:.5f} | Order: {order_id}")
-            return result
+        # Handle local MT5 result (simple dict) vs MetaAPI result
+        if result:
+            # For local MT5 results
+            if 'ticket' in result:
+                print(f"[MT5] ✅ {direction} {lot} {symbol} | SL: {sl:.5f} TP: {tp:.5f} | Ticket: {result['ticket']}")
+                return result
+            # For MetaAPI results
+            elif result.get('stringCode') == 'TRADE_RETCODE_DONE':
+                order_id = result.get('orderId', result.get('positionId', ''))
+                open_price = result.get('price', 0)
+                print(f"[MT5] ✅ {direction} {lot} {symbol} @ {open_price} | SL: {sl:.5f} TP: {tp:.5f} | Order: {order_id}")
+                return result
+            else:
+                string_code = result.get('stringCode', '')
+                message = result.get('message', '')
+                print(f"[MT5] ❌ Order rejected: {message or string_code}")
+                return None
         else:
-            string_code = result.get('stringCode', '') if result else ''
-            message = result.get('message', '') if result else ''
-            error_msg = message or string_code or 'No result'
-            print(f"[MT5] ❌ Order rejected: stringCode={string_code!r} | message={message!r}")
-            print(f"[MT5]    Full result: {result}")
+            print(f"[MT5] ❌ Order failed: no result")
             return None
 
     except Exception as e:
@@ -459,16 +455,9 @@ async def open_position_with_retry(ctx, symbol, direction, lot, sl, tp, comment=
                 import traceback
                 print(f"[MT5-ORDER-RETRY] ⚠️ Attempt {attempt + 1} exception: {last_error}")
                 traceback.print_exc()
-                # Refresh connection on transient websocket/timeout errors
-                if any(k in last_error.lower() for k in ['timeout', 'disconnect', 'not connected', 'websocket']):
-                    try:
-                        from mt5.metaapi_manager import get_user_connection
-                        fresh = await get_user_connection(ctx.telegram_id, ctx.metaapi_account_id)
-                        if fresh is not None:
-                            ctx.connection = fresh
-                            print(f"[MT5-ORDER-RETRY] 🔄 Refreshed connection before retry")
-                    except Exception:
-                        pass
+                # For local MT5, connection is persistent
+                # Just log the error and retry
+                print(f"[MT5-ORDER-RETRY] 🔄 Retrying with local MT5 terminal")
         
         attempt += 1
         
@@ -485,25 +474,36 @@ async def open_position_with_retry(ctx, symbol, direction, lot, sl, tp, comment=
 async def close_position(ctx, position_id, max_retries=3, backoff_seconds=2):
     """
     Close an open position by position ID, with retry on transient connection errors.
+    Handles both MetaAPI (async, returns dict) and local MT5 (sync, returns bool).
 
     Args:
         ctx: MT5UserContext
-        position_id: Position ID (string)
+        position_id: Position ID (string or int)
 
     Returns:
-        dict (MetaAPI trade result) or None on failure
+        dict/bool (result) or None on failure
     """
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            result = await ctx.connection.close_position(str(position_id))
+            # Call close_position (works with both connection types)
+            result = ctx.connection.close_position(int(position_id) if isinstance(position_id, str) and position_id.isdigit() else position_id)
 
-            if result and result.get('stringCode') == 'TRADE_RETCODE_DONE':
-                print(f"[MT5] Closed position {position_id}")
+            # Handle local MT5 result (boolean)
+            if isinstance(result, bool):
+                if result:
+                    print(f"[MT5] ✅ Closed position {position_id}")
+                    return result
+                else:
+                    print(f"[MT5] ❌ Close failed for {position_id}: broker rejection")
+                    return None
+            # Handle MetaAPI result (dict)
+            elif result and result.get('stringCode') == 'TRADE_RETCODE_DONE':
+                print(f"[MT5] ✅ Closed position {position_id}")
                 return result
             else:
                 error_msg = (result.get('message', 'Unknown error') if result else 'No result')
-                print(f"[MT5] Close failed for {position_id}: {error_msg}")
+                print(f"[MT5] ❌ Close failed for {position_id}: {error_msg}")
                 return None  # broker-level rejection — don't retry
 
         except Exception as e:
@@ -512,14 +512,8 @@ async def close_position(ctx, position_id, max_retries=3, backoff_seconds=2):
             if attempt < max_retries:
                 # Refresh cached connection on connection errors before retrying
                 if any(k in last_error.lower() for k in ['timeout', 'disconnect', 'not connected', 'websocket']):
-                    try:
-                        from mt5.metaapi_manager import get_user_connection
-                        fresh = await get_user_connection(ctx.telegram_id, ctx.metaapi_account_id)
-                        if fresh is not None:
-                            ctx.connection = fresh
-                            print(f"[MT5] 🔄 Refreshed connection before close retry")
-                    except Exception:
-                        pass
+                    # Local MT5 connection is persistent, skip refresh
+                    pass
                 await asyncio.sleep(backoff_seconds * attempt)
 
     print(f"[MT5] ❌ close_position failed after {max_retries} attempts: {last_error}")
@@ -529,32 +523,42 @@ async def close_position(ctx, position_id, max_retries=3, backoff_seconds=2):
 async def modify_position_sl(ctx, position_id, new_sl, new_tp=None, max_retries=3, backoff_seconds=2):
     """
     Modify the stop loss (and optionally take profit) of an open position,
-    with retry on transient connection errors.
+    with retry on transient connection errors. Handles both MetaAPI and local MT5.
 
     Args:
         ctx: MT5UserContext
-        position_id: Position ID (string)
+        position_id: Position ID (string or int)
         new_sl: New stop loss price
         new_tp: New take profit price (optional)
 
     Returns:
-        dict (MetaAPI trade result) or None on failure
+        dict/bool (result) or None on failure
     """
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            modify_options = {'stopLoss': new_sl}
-            if new_tp is not None:
-                modify_options['takeProfit'] = new_tp
+            # Convert position_id to int if needed
+            pos_id = int(position_id) if isinstance(position_id, str) and position_id.isdigit() else position_id
+            
+            # Call modify_position with (ticket, sl, tp) - works with both connection types
+            result = ctx.connection.modify_position(pos_id, new_sl, new_tp)
 
-            result = await ctx.connection.modify_position(str(position_id), modify_options)
-
-            if result and result.get('stringCode') == 'TRADE_RETCODE_DONE':
-                print(f"[MT5] Modified position {position_id} | New SL: {new_sl:.5f}")
+            # Handle local MT5 result (boolean)
+            if isinstance(result, bool):
+                if result:
+                    tp_str = f" | New TP: {new_tp:.5f}" if new_tp else ""
+                    print(f"[MT5] ✅ Modified position {position_id} | New SL: {new_sl:.5f}{tp_str}")
+                    return result
+                else:
+                    print(f"[MT5] ❌ Modify failed for {position_id}: broker rejection")
+                    return None
+            # Handle MetaAPI result (dict)
+            elif result and result.get('stringCode') == 'TRADE_RETCODE_DONE':
+                print(f"[MT5] ✅ Modified position {position_id} | New SL: {new_sl:.5f}")
                 return result
             else:
                 error_msg = (result.get('message', 'Unknown error') if result else 'No result')
-                print(f"[MT5] Modify failed for {position_id}: {error_msg}")
+                print(f"[MT5] ❌ Modify failed for {position_id}: {error_msg}")
                 return None  # broker-level rejection — don't retry
 
         except Exception as e:
@@ -562,14 +566,8 @@ async def modify_position_sl(ctx, position_id, new_sl, new_tp=None, max_retries=
             print(f"[MT5] Error modifying position {position_id} (attempt {attempt}/{max_retries}): {e}")
             if attempt < max_retries:
                 if any(k in last_error.lower() for k in ['timeout', 'disconnect', 'not connected', 'websocket']):
-                    try:
-                        from mt5.metaapi_manager import get_user_connection
-                        fresh = await get_user_connection(ctx.telegram_id, ctx.metaapi_account_id)
-                        if fresh is not None:
-                            ctx.connection = fresh
-                            print(f"[MT5] 🔄 Refreshed connection before modify retry")
-                    except Exception:
-                        pass
+                    # Local MT5 connection is persistent, skip refresh
+                    pass
                 await asyncio.sleep(backoff_seconds * attempt)
 
     print(f"[MT5] ❌ modify_position_sl failed after {max_retries} attempts: {last_error}")
@@ -583,12 +581,14 @@ async def modify_position_sl(ctx, position_id, new_sl, new_tp=None, max_retries=
 async def get_open_positions(ctx, magic_only=True):
     """
     Get all open positions (optionally filtered by magic number).
+    Handles both MetaAPI (async) and local MT5 (sync) connections.
 
     Returns:
         list of position dicts
     """
     try:
-        positions = await ctx.connection.get_positions()
+        # Call get_positions (works with both connection types)
+        positions = ctx.connection.get_positions()
         if positions is None:
             return []
 

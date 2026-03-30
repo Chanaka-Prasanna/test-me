@@ -22,6 +22,129 @@ from telebot import types
 from config import BOT_CREATOR_ID
 
 
+def safe_edit_and_answer(bot, call, text, keyboard=None, parse_mode='HTML'):
+    """Safely edit message and answer callback query - handles timeouts and unchanged messages"""
+    try:
+        # Try to edit message
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=keyboard
+            )
+        except Exception as edit_error:
+            error_str = str(edit_error)
+            # Ignore these non-critical errors
+            if "message is not modified" not in error_str and "query is too old" not in error_str:
+                raise
+        
+        # Try to answer callback query
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception as answer_error:
+            # Ignore callback timeout errors - they're expected if user waits too long
+            if "query is too old" not in str(answer_error) and "query ID is invalid" not in str(answer_error):
+                raise
+    except Exception as e:
+        print(f"[CALLBACK-SAFE-EDIT] Error: {e}")
+        # Final attempt to notify - if this fails, just log it
+        try:
+            bot.answer_callback_query(call.id, f"⚠️ Error: {str(e)[:40]}", show_alert=False)
+        except:
+            pass
+
+
+def safe_answer_callback(bot, call, text=None, show_alert=False):
+    """Safely answer callback query - handles timeouts gracefully"""
+    try:
+        if text:
+            bot.answer_callback_query(call.id, text, show_alert=show_alert)
+        else:
+            bot.answer_callback_query(call.id)
+    except Exception as e:
+        error_str = str(e)
+        # These errors are expected and safe to ignore
+        if "query is too old" not in error_str and "query ID is invalid" not in error_str:
+            print(f"[CALLBACK-ANSWER] Error: {e}")
+
+
+def _get_running_trading_keyboard():
+    """Keyboard shown while MT5 trading is active."""
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.row(
+        types.InlineKeyboardButton("🛑 Stop Trading", callback_data="stop_trading"),
+        types.InlineKeyboardButton("📊 View Status", callback_data="view_status")
+    )
+    keyboard.row(
+        types.InlineKeyboardButton("💰 Balance", callback_data="view_balance"),
+        types.InlineKeyboardButton("🔙 Back", callback_data="user_dashboard")
+    )
+    return keyboard
+
+
+def _start_mt5_trading_from_callback(bot, call, user_id, username_key):
+    """One-tap MT5 trading start used by both current and legacy buttons."""
+    initialize_mt5_session(username_key, user_id)
+
+    # Let the user know the bot is working before the MT5 startup call blocks.
+    safe_answer_callback(bot, call, "⏳ Connecting to MT5...", show_alert=False)
+
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="<b>⏳ Connecting to MT5...</b>\n\n"
+                 "Starting local MT5 connection.\n"
+                 "Please wait...",
+            parse_mode='HTML',
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e) and "query is too old" not in str(e):
+            raise
+
+    from utils.bg_loop import loop, start_background_loop, is_background_loop_running
+    import asyncio
+    from concurrent.futures import TimeoutError as FutureTimeoutError
+
+    if not is_background_loop_running():
+        print("[START_TRADING] Background loop was not running, starting it now")
+        start_background_loop()
+
+    print(f"[START_TRADING] Scheduling MT5 trading task for {username_key}")
+
+    future = asyncio.run_coroutine_threadsafe(
+        start_mt5_trading(bot, user_id, username_key), loop
+    )
+
+    try:
+        success = future.result(timeout=20)
+    except FutureTimeoutError:
+        print(f"[START_TRADING] Timed out waiting for MT5 startup for {username_key}")
+        safe_answer_callback(
+            bot,
+            call,
+            "❌ MT5 startup timed out. Check terminal logs.",
+            show_alert=True
+        )
+        return
+
+    if success:
+        safe_edit_and_answer(
+            bot, call,
+            text="<b>🚀 MT5 FOREX TRADING STARTED 🚀</b>\n"
+                 "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                 "✅ <b>Status:</b> <u>Running</u>\n"
+                 "✅ <b>Pair:</b> XAUUSD (Gold)\n"
+                 "✅ <b>Connection:</b> Local MT5 Terminal\n\n"
+                 "<i>Trading is now active. Monitor your positions below.</i>",
+            keyboard=_get_running_trading_keyboard()
+        )
+    else:
+        safe_answer_callback(bot, call, "❌ Failed to start MT5 trading", show_alert=True)
+
+
 def handle_callback_query(bot, call):
     """Handle all callback queries from inline buttons - Single user version"""
     callback_data = call.data
@@ -59,93 +182,26 @@ def handle_callback_query(bot, call):
         try:
             # Check if trading is already active
             if is_mt5_trading_active(username_key):
-                bot.answer_callback_query(call.id, "⚠️ MT5 Trading is already running!", show_alert=True)
+                safe_answer_callback(bot, call, "⚠️ MT5 Trading is already running!", show_alert=True)
                 return
-            
-            initialize_mt5_session(username_key, user_id)
-            
-            # Show start confirmation
-            keyboard = types.InlineKeyboardMarkup()
-            keyboard.row(
-                types.InlineKeyboardButton("🚀 Start MT5 Trading", callback_data="trade_mode_mt5"),
-                types.InlineKeyboardButton("📊 View Balance", callback_data="view_balance")
-            )
-            keyboard.row(
-                types.InlineKeyboardButton("🔙 Back", callback_data="user_dashboard")
-            )
-            
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=f"<b>✅ READY TO TRADE ✅</b>\n"
-                     f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                     f"💹 <b>Platform:</b> MT5 (Local Terminal)\n"
-                     f"📊 <b>Pair:</b> XAUUSD (Gold)\n"
-                     f"🆔 <b>Account:</b> <code>101047292</code>\n\n"
-                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                     f"<b>Ready to start trading?</b>",
-                parse_mode='HTML',
-                reply_markup=keyboard
-            )
-            bot.answer_callback_query(call.id)
+
+            _start_mt5_trading_from_callback(bot, call, user_id, username_key)
         except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}", show_alert=True)
+            print(f"[START_TRADING] Error: {e}")
+            safe_answer_callback(bot, call, f"❌ Error: {str(e)[:50]}", show_alert=True)
         return
     
-    # Start MT5 Trading
+    # Start MT5 Trading (legacy compatibility for older inline keyboards)
     if callback_data == "trade_mode_mt5":
         try:
-            initialize_mt5_session(username_key, user_id)
-            
-            # Notify user connection is starting
-            bot.answer_callback_query(call.id, "⏳ Connecting to MT5...", show_alert=False)
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text="<b>⏳ Connecting to MT5...</b>\n\n"
-                     "Starting local MT5 connection.\n"
-                     "Please wait...",
-                parse_mode='HTML',
-            )
-            
-            # Start the trading loop
-            from utils.bg_loop import loop
-            import asyncio
-            
-            future = asyncio.run_coroutine_threadsafe(
-                start_mt5_trading(bot, user_id, username_key), loop
-            )
-            success = future.result()
-            
-            if success:
-                keyboard = types.InlineKeyboardMarkup()
-                keyboard.row(
-                    types.InlineKeyboardButton("🛑 Stop Trading", callback_data="stop_trading"),
-                    types.InlineKeyboardButton("📊 View Status", callback_data="view_status")
-                )
-                keyboard.row(
-                    types.InlineKeyboardButton("💰 Balance", callback_data="view_balance"),
-                    types.InlineKeyboardButton("🔙 Back", callback_data="user_dashboard")
-                )
-                
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text="<b>🚀 MT5 FOREX TRADING STARTED 🚀</b>\n"
-                         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                         "✅ <b>Status:</b> <u>Running</u>\n"
-                         "✅ <b>Pair:</b> XAUUSD (Gold)\n"
-                         "✅ <b>Connection:</b> Local MT5 Terminal\n\n"
-                         "<i>Trading is now active. Monitor your positions below.</i>",
-                    parse_mode='HTML',
-                    reply_markup=keyboard
-                )
-            else:
-                bot.answer_callback_query(call.id, "❌ Failed to start MT5 trading", show_alert=True)
-            
-            bot.answer_callback_query(call.id)
+            if is_mt5_trading_active(username_key):
+                safe_answer_callback(bot, call, "⚠️ MT5 Trading is already running!", show_alert=True)
+                return
+
+            _start_mt5_trading_from_callback(bot, call, user_id, username_key)
         except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}", show_alert=True)
+            print(f"[TRADE_MODE_MT5] Error: {e}")
+            safe_answer_callback(bot, call, f"❌ Error: {str(e)[:50]}", show_alert=True)
         return
     
     # Stop Trading
@@ -187,16 +243,10 @@ def handle_callback_query(bot, call):
                     "<i>You can start trading anytime.</i>"
                 )
             
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=msg,
-                parse_mode='HTML',
-                reply_markup=keyboard
-            )
-            bot.answer_callback_query(call.id, "🛑 Trading stopped")
+            safe_edit_and_answer(bot, call, text=msg, keyboard=keyboard)
         except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}", show_alert=True)
+            print(f"[STOP_TRADING] Error: {e}")
+            safe_answer_callback(bot, call, f"❌ Error: {str(e)[:50]}", show_alert=True)
         return
     
     # View Balance
@@ -215,7 +265,7 @@ def handle_callback_query(bot, call):
                     f"📊 <b>Total:</b> <code>{balance:.2f} {currency}</code>"
                 )
             else:
-                bot.answer_callback_query(call.id, "❌ Unable to fetch balance. Connect to MT5 first.", show_alert=True)
+                safe_answer_callback(bot, call, "❌ Unable to fetch balance. Connect to MT5 first.", show_alert=True)
                 return
             
             keyboard = types.InlineKeyboardMarkup()
@@ -223,17 +273,10 @@ def handle_callback_query(bot, call):
                 types.InlineKeyboardButton("🔙 Back", callback_data="user_dashboard")
             )
             
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=balance_text,
-                parse_mode='HTML',
-                reply_markup=keyboard
-            )
-            
-            bot.answer_callback_query(call.id)
+            safe_edit_and_answer(bot, call, text=balance_text, keyboard=keyboard)
         except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}", show_alert=True)
+            print(f"[VIEW_BALANCE] Error: {e}")
+            safe_answer_callback(bot, call, f"❌ Error: {str(e)[:50]}", show_alert=True)
         return
     
     # View Trading Status
@@ -314,20 +357,12 @@ def handle_callback_query(bot, call):
                 else:
                     message += "<i>No open positions</i>\n"
                 
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=message,
-                    parse_mode='HTML',
-                    reply_markup=keyboard
-                )
+                safe_edit_and_answer(bot, call, text=message, keyboard=keyboard)
             else:
-                bot.answer_callback_query(call.id, "❌ No active session. Start trading first.", show_alert=True)
-            
-            bot.answer_callback_query(call.id)
+                safe_answer_callback(bot, call, "❌ No active session. Start trading first.", show_alert=True)
         except Exception as e:
             print(f"[VIEW_STATUS] Error: {e}")
-            bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}", show_alert=True)
+            safe_answer_callback(bot, call, f"❌ Error: {str(e)[:50]}", show_alert=True)
         return
     
     # User Dashboard
@@ -370,17 +405,11 @@ def handle_callback_query(bot, call):
                 f"<b>Choose an action:</b>"
             )
             
-            bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=welcome_text,
-                parse_mode='HTML',
-                reply_markup=keyboard
-            )
-            bot.answer_callback_query(call.id)
+            safe_edit_and_answer(bot, call, text=welcome_text, keyboard=keyboard)
         except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}", show_alert=True)
+            print(f"[USER_DASHBOARD] Error: {e}")
+            safe_answer_callback(bot, call, f"❌ Error: {str(e)[:50]}", show_alert=True)
         return
     
     # Default response for unknown callbacks
-    bot.answer_callback_query(call.id, "Unknown action", show_alert=False)
+    safe_answer_callback(bot, call, "Unknown action", show_alert=False)

@@ -50,7 +50,7 @@ CRASH_COOLDOWN_MINUTES = 1440        # Wait 24 hours before resuming after crash
 # =====================================================
 
 # Forex Symbols to Trade
-MT5_FOREX_SYMBOLS = ["XAUUSD"]       # Gold
+MT5_FOREX_SYMBOLS = ["GOLD"]       # Gold
 
 # MT5 Trading Parameters
 MT5_LOT_SIZE = 0.01                  # Default lot size
@@ -118,7 +118,7 @@ MT5_STOCH_RSI_SHORT_LEVEL = 80       # StochRSI threshold for SHORT signals
 MT5_STOCH_RSI_BUY_LEVEL = 20         # StochRSI threshold for BUY signals
 MT5_MIN_SIGNAL_SCORE = 0.5           # Minimum signal confidence (0.0 - 1.0)
 MT5_CANDLES_FOR_ANALYSIS = 100       # Number of candles to analyze
-MT5_SCAN_INTERVAL_SECONDS = 60       # Scan for signals every N seconds
+MT5_SCAN_INTERVAL_SECONDS = 10       # Scan for signals every N seconds (faster scanning)
 MT5_SLEEP_BETWEEN_SYMBOLS = 2        # Sleep between symbol scans (seconds)
 
 def get_mt5_balance_based_params(balance):

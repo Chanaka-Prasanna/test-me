@@ -1,17 +1,11 @@
 """
-MT5 Forex Trading Handler for Telegram Bot (Local MT5 Terminal — Single User)
-Manages MT5 trading sessions using direct local terminal connection.
-Simplified for personal trading bot with hardcoded credentials.
+MT5 Forex Trading Handler for Telegram Bot (MetaAPI Cloud — Multi-User)
+Manages MT5 trading sessions for multiple users simultaneously via MetaAPI.
+Each user gets their own cloud connection — no local MT5 terminal needed.
 """
 import asyncio
 from datetime import datetime, timedelta
 
-from mt5.local_mt5_connection import (
-    connect_mt5,
-    disconnect_mt5,
-    is_mt5_connected,
-    get_mt5_connection,
-)
 from mt5.mt5_config import (
     FOREX_SYMBOLS,
     LOT_SIZE,
@@ -37,12 +31,31 @@ from mt5.mt5_config import (
 )
 from config import (
     CRASH_COOLDOWN_MINUTES,
-    MT5_CRASH_DROP_THRESHOLD_PCT,
     MT5_CRASH_MONITORING_CANDLES,
     MT5_CRASH_MONITORING_TIMEFRAME,
     get_mt5_balance_based_params,
     MT5_MIN_BALANCE_TO_TRADE,
-    BOT_CREATOR_ID,
+)
+from mt5.mt5_core import (
+    MT5UserContext,
+    create_user_context,
+    connect_mt5,
+    disconnect_mt5,
+    is_mt5_connected,
+    get_current_price,
+    get_account_balance,
+    get_account_info,
+    get_symbol_info,
+    get_open_positions,
+    get_active_positions_count,
+    open_position,
+    open_position_with_retry,
+    close_position,
+    modify_position_sl,
+    find_support_level_mt5,
+    find_resistance_level_mt5,
+    resolve_symbol,
+    get_position_realized_pnl,
 )
 from mt5.mt5_signals import get_trade_signal_mt5
 from mt5.mt5_crash_protection import mt5_crash_protector
@@ -168,7 +181,7 @@ def initialize_mt5_session(username_key, telegram_id):
 
 
 async def start_mt5_trading(bot, telegram_id, username_key, existing_ctx=None):
-    """Start MT5 forex trading loop using local terminal connection"""
+    """Start MT5 forex trading loop for a user via MetaAPI"""
     print(f"[MT5-TRADING] 🚀 Starting MT5 trading for {username_key}")
 
     # RESET crash mode on new session (fresh start after restart)
@@ -183,48 +196,34 @@ async def start_mt5_trading(bot, telegram_id, username_key, existing_ctx=None):
     mt5_user_data[username_key]["cooldown_notification_sent"] = False
     mt5_user_data[username_key]["market_closed_notification_sent"] = False
 
-    # Connect to local MT5 terminal
-    print(f"[MT5-TRADING] 🔌 Connecting to local MT5 terminal...")
-    if not connect_mt5():
-        print(f"[MT5-TRADING] ❌ Failed to connect to local MT5 terminal")
-        bot.send_message(
-            telegram_id,
-            "❌ <b>MT5 Connection Failed</b>\n\n"
-            "Cannot connect to local MT5 terminal.\n"
-            "Make sure MetaTrader 5 is running on your computer.",
-            parse_mode="HTML"
-        )
-        return False
+    if existing_ctx is not None:
+        ctx = existing_ctx
+    else:
+        # No Firebase needed for local MT5 terminal — create context directly
+        ctx = await create_user_context(telegram_id, metaapi_account_id="", bot=bot)
+        
+        if ctx is None:
+            print(f"[MT5-TRADING] ❌ Failed to create MT5 context for telegram_id: {telegram_id}")
+            return False
+
+    mt5_user_data[username_key]["ctx"] = ctx
+
+    # Resolve active symbols for this user's broker (e.g. XAUUSDm, GOLD, etc.)
+    print(f"[MT5-TRADING] 🔍 Resolving trading symbols for {username_key}...")
+    resolved_symbols = []
+    for sym in FOREX_SYMBOLS:
+        print(f"[MT5-TRADING]   Starting symbol resolution for: {sym}")
+        real_sym = await resolve_symbol(ctx, sym)
+        print(f"[MT5-TRADING]   Resolved {sym} → {real_sym}")
+        resolved_symbols.append(real_sym)
+        # Also update crash protector dynamically if needed (passed per context)
+        # Note: crash_protector now dynamically takes reference_symbol
     
-    # Get connection and verify
-    conn = get_mt5_connection()
-    if not conn.is_connected():
-        print(f"[MT5-TRADING] ❌ MT5 not connected after initialization")
-        return False
-    
-    # Store connection in user data
-    mt5_user_data[username_key]["ctx"] = conn
-    
-    # Verify account info
-    account_info = conn.get_account_info()
-    if not account_info:
-        print(f"[MT5-TRADING] ❌ Cannot retrieve account info")
-        bot.send_message(
-            telegram_id,
-            "❌ <b>Account Error</b>\n\n"
-            "Cannot retrieve account information from MT5.",
-            parse_mode="HTML"
-        )
-        return False
-    
-    print(f"[MT5-TRADING] ✅ Connected to MT5")
-    print(f"   Account: {account_info['login']}")
-    print(f"   Balance: ${account_info['balance']:,.2f}")
-    print(f"   Leverage: 1:{account_info['leverage']}")
-    
+    print(f"[MT5-TRADING] ✅ Final active symbols: {resolved_symbols}")
+    mt5_user_data[username_key]["active_symbols"] = resolved_symbols
+
     mt5_user_data[username_key]["trading_mode"] = "MT5 Forex Trading"
     mt5_user_data[username_key]["bot_status"] = "Running"
-    mt5_user_data[username_key]["active_symbols"] = FOREX_SYMBOLS.copy()
 
     if username_key not in mt5_user_tasks:
         mt5_user_tasks[username_key] = {}
@@ -239,7 +238,7 @@ async def start_mt5_trading(bot, telegram_id, username_key, existing_ctx=None):
 
 
 async def stop_mt5_trading(username_key):
-    """Stop MT5 trading loop and disconnect local terminal"""
+    """Stop MT5 trading loop and disconnect user"""
     print(f"[MT5-TRADING] 🛑 Stopping MT5 trading for {username_key}")
 
     if username_key in mt5_user_data:
@@ -257,16 +256,18 @@ async def stop_mt5_trading(username_key):
                     print(f"[MT5-TRADING] Cancelled {task_name} task for {username_key}")
             mt5_user_tasks[username_key].clear()
 
-        # Disconnect local MT5 terminal
-        disconnect_mt5()
-        mt5_user_data[username_key]["ctx"] = None
+        # Disconnect MetaAPI connection for this user
+        ctx = mt5_user_data[username_key].get("ctx")
+        if ctx:
+            await disconnect_mt5(ctx.telegram_id)
+            mt5_user_data[username_key]["ctx"] = None
 
         return True
     return False
 
 
 async def mt5_trade_loop(username: str, bot, telegram_id: int):
-    """Main MT5 trading loop — simplified for local terminal connection"""
+    """Main MT5 trading loop — scans forex pairs via MetaAPI, opens/manages positions"""
     print(f"[MT5-LOOP] 🚀 ENTERED mt5_trade_loop for {username} at {datetime.now()}")
     print(
         "[MT5-CONFIG] "
@@ -287,71 +288,136 @@ async def mt5_trade_loop(username: str, bot, telegram_id: int):
     while mt5_user_data[username]["bot_status"] == "Running":
         loop_count += 1
 
-        # Get local MT5 connection (not MetaAPI context)
-        conn = get_mt5_connection()
-        if not conn.is_connected():
-            print(f"[MT5-LOOP] ❌ MT5 connection lost for {username}")
+        ctx = mt5_user_data[username].get("ctx")
+        if ctx is None:
+            print(f"[MT5-LOOP] ❌ No MetaAPI context for {username}")
             await asyncio.sleep(10)
             continue
 
-        # === SIMPLE CRASH PROTECTION ===
+        # === CRASH PROTECTION ===
         try:
-            # Check for market crash by detecting large price drops
-            cr_sym = "XAUUSD"  # Simplified - always use XAUUSD for crash detection
-            candles = conn.get_candles(cr_sym, MT5_CRASH_MONITORING_TIMEFRAME, MT5_CRASH_MONITORING_CANDLES + 5)
-            
-            if candles and len(candles) >= 2:
-                current_close = candles[-1]['close']
-                window_high = max(c['high'] for c in candles[-MT5_CRASH_MONITORING_CANDLES:])
-                drop_pct = ((current_close - window_high) / window_high) * 100 if window_high > 0 else 0
+            cr_sym = _mt5_crash_reference_symbol(username)
+            crash_result = await mt5_crash_protector.check_for_crash(ctx, reference_symbol=cr_sym)
+            if crash_result.get('is_crashing'):
+                print(f"[MT5-LOOP] 🚨 CRASH DETECTED: {crash_result.get('reason')}")
                 
-                if drop_pct <= MT5_CRASH_DROP_THRESHOLD_PCT:  # e.g., -3% or worse
-                    print(f"[MT5-LOOP] 🚨 MARKET CRASH DETECTED: {cr_sym} down {drop_pct:.1f}%")
-                    mt5_crash_protector.crash_mode = True
-                    mt5_crash_protector.crash_triggered_at = datetime.now()
+                # Notify user about crash detection (once per hour)
+                last_notification_time = mt5_user_data[username].get('last_crash_notification_sent', None)
+                now = datetime.now()
+                should_send = False
+                
+                if last_notification_time is None:
+                    should_send = True
+                else:
+                    time_since_last = (now - last_notification_time).total_seconds()
+                    if time_since_last >= 3600:  # 1 hour = 3600 seconds
+                        should_send = True
+                
+                if should_send:
+                    drop_pct = crash_result.get('drop_pct', 0)
+                    current_price = crash_result.get('current_price', 0)
+                    window_high = crash_result.get('window_high', 0)
                     
-                    # Close all positions
-                    positions = conn.get_positions()
-                    if positions:
-                        for pos in positions:
-                            conn.close_position(pos['ticket'])
-                            print(f"[MT5-LOOP] ✅ Closed position {pos['ticket']} (crash protection)")
-                    
-                    bot.send_message(
-                        telegram_id,
-                        f"🚨 <b>CRASH DETECTED!</b>\n"
-                        f"{cr_sym} down {drop_pct:.1f}%\n"
-                        f"All positions closed.\n"
-                        f"Trading paused for 24 hours.",
-                        parse_mode="HTML"
-                    )
-                    await asyncio.sleep(60)
-                    continue
-        except Exception as e:
-            print(f"[MT5-LOOP] ⚠️ Crash check error: {str(e)[:100]}")
-
-        # === GET ACCOUNT STATUS ===
-        try:
-            balance = conn.get_balance()
-            equity = conn.get_equity()
-            
-            if balance is None:
-                print(f"[MT5-LOOP] ❌ Cannot get account balance")
-                await asyncio.sleep(10)
+                    try:
+                        bot.send_message(
+                            chat_id=telegram_id,
+                            text=f"<b>🚨 MARKET CRASH DETECTED - MT5 TRADING HALTED</b>\n"
+                                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                                 f"📊 <b>{cr_sym} dropped {drop_pct:.1f}%</b>\n"
+                                 f"💰 Price: ${window_high:.2f} → ${current_price:.2f}\n"
+                                 f"⏱️ Timeframe: M5 window (see bot crash settings)\n\n"
+                                 f"🛡️ <b>Actions Taken:</b>\n"
+                                 f"✅ All positions closed\n"
+                                 f"✅ Trading paused for cooldown\n\n"
+                                 f"⏳ <b>Cooldown:</b> {CRASH_COOLDOWN_MINUTES} minutes active\n\n"
+                                 f"💡 <b>To skip waiting:</b> Stop trading and restart from main menu.",
+                            parse_mode='HTML'
+                        )
+                        mt5_user_data[username]['last_crash_notification_sent'] = now
+                        mt5_user_data[username]['cooldown_notification_sent'] = False  # Reset cooldown flag for fresh crash
+                    except Exception as e:
+                        print(f"[MT5-LOOP] ⚠️ Failed to send crash notification: {e}")
+                
+                await mt5_crash_protector.emergency_close_all(
+                    ctx, username, mt5_user_data, bot, telegram_id
+                )
+                print(f"[MT5-LOOP] ⏸️ MT5 Trading paused — crash cooldown active")
+                await asyncio.sleep(60)
                 continue
+
+            balance = await get_account_balance(ctx)
+            mt5_crash_protector.set_daily_start_balance(telegram_id, balance)
+            trading_allowed, block_reason = mt5_crash_protector.is_trading_allowed(telegram_id, balance)
             
-            account_info = conn.get_account_info()
-            active_positions = conn.get_positions(symbol="XAUUSD")
-            active_count = len(active_positions) if active_positions else 0
+            # SAFETY CHECK: If cooldown expired naturally, auto-reset crash mode
+            if "Crash cooldown" in block_reason and mt5_crash_protector.crash_triggered_at:
+                elapsed = (datetime.now() - mt5_crash_protector.crash_triggered_at).total_seconds() / 60
+                if elapsed >= CRASH_COOLDOWN_MINUTES:
+                    print(f"[MT5-LOOP] 🔄 Crash cooldown expired naturally - resetting crash mode")
+                    mt5_crash_protector.reset_crash_mode()
+                    mt5_user_data[username]['last_crash_notification_sent'] = None  # Reset notification timestamp
+                    mt5_user_data[username]['cooldown_notification_sent'] = False  # Reset cooldown flag
+                    trading_allowed, block_reason = mt5_crash_protector.is_trading_allowed(telegram_id, balance)
             
-            print(f"[MT5-LOOP] 🔄 Loop #{loop_count} | Balance: ${balance:.2f} | Equity: ${equity:.2f} | Active: {active_count}/{MAX_CONCURRENT_TRADES}")
-            
+            if not trading_allowed:
+                print(f"[MT5-LOOP] ⛔ Trading blocked: {block_reason}")
+                # Notify user about crash cooldown (throttled to 1 hour)
+                if "Crash cooldown" in block_reason:
+                    now = datetime.now()
+                    last_cooldown_notif = mt5_user_data[username].get('last_cooldown_notification_sent')
+                    should_notify_cooldown = False
+                    
+                    if not last_cooldown_notif or (now - last_cooldown_notif).total_seconds() >= 3600:
+                        should_notify_cooldown = True
+                    
+                    if should_notify_cooldown:
+                        try:
+                            bot.send_message(
+                                chat_id=telegram_id,
+                                text=f"<b>🚨 XM Forex Gold (MT5) Trading Status: PAUSED</b>\n"
+                                     f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                                     f"⏸️ <b>Reason:</b> Market Crash Protection\n"
+                                     f"📌 <b>Status:</b> {block_reason}\n\n"
+                                     f"⏰ <i>Trading will automatically resume after the cooldown period.</i>",
+                                parse_mode='HTML'
+                            )
+                            # Update the hourly throttle timestamp
+                            mt5_user_data[username]['last_cooldown_notification_sent'] = now
+                            mt5_user_data[username]['cooldown_notification_sent'] = True
+                        except Exception as e:
+                            print(f"[MT5-LOOP] ⚠️ Failed to send crash notification: {e}")
+                await asyncio.sleep(30)
+                continue
         except Exception as e:
-            print(f"[MT5-LOOP] ⚠️ Error getting account info: {str(e)[:100]}")
+            print(f"[MT5-LOOP] ⚠️ Crash protection check error: {e}")
+
+        # Reconnect if needed
+        if not await is_mt5_connected(telegram_id):
+            print(f"[MT5-LOOP] ⚠️ MT5 connection lost, attempting automatic reconnect...")
+            # Reconnect using local MT5 (no Firebase needed)
+            new_ctx = await create_user_context(telegram_id, metaapi_account_id="", bot=bot)
+            if new_ctx:
+                mt5_user_data[username]["ctx"] = new_ctx
+                ctx = new_ctx
+                print(f"[MT5-LOOP] ✅ MT5 reconnected successfully")
+            else:
+                print(f"[MT5-LOOP] ❌ Failed to reconnect MT5, retrying in 30s...")
+                await asyncio.sleep(30)
+                continue
+
+        # Sync positions with MetaAPI
+        try:
+            await sync_mt5_positions(username, ctx, bot, telegram_id)
+            active_count = await get_active_positions_count(ctx, magic_only=True)
+            balance = await get_account_balance(ctx)
+        except Exception as e:
+            print(f"[MT5-LOOP] ⚠️ Error syncing positions or balance: {e}")
             await asyncio.sleep(5)
             continue
 
-        # === PERIODIC STATUS MESSAGE (every 1 hour) ===
+        print(f"\n[MT5-LOOP] 🔄 Loop #{loop_count} | User: {username} | Balance: ${balance:.2f} | Active: {active_count}/{MAX_CONCURRENT_TRADES}")
+
+        # Periodic status message (every 1 hour)
         now = datetime.now()
         if (now - last_status_time).total_seconds() > 3600:
             try:
@@ -359,133 +425,378 @@ async def mt5_trade_loop(username: str, bot, telegram_id: int):
                     chat_id=telegram_id,
                     text=f"📊 <b>MT5 Hourly Update</b>\n"
                          f"💰 Balance: <code>${balance:.2f}</code>\n"
-                         f"📈 Equity: <code>${equity:.2f}</code>\n"
-                         f"📍 Active Trades: {active_count}/{MAX_CONCURRENT_TRADES}",
+                         f"📈 Active Trades: {active_count}/{MAX_CONCURRENT_TRADES}",
                     parse_mode='HTML'
                 )
                 last_status_time = now
             except Exception as e:
-                print(f"[MT5-LOOP] ⚠️ Error sending status: {e}")
+                print(f"[MT5-LOOP] ⚠️ Failed to send status: {e}")
 
-        # === PREVENT INSUFFICIENT FUNDS ===
-        if balance < MT5_MIN_BALANCE_TO_TRADE:
-            print(f"[MT5-LOOP] ⛔ Balance too low (${balance:.2f} < ${MT5_MIN_BALANCE_TO_TRADE:.2f})")
-            if not mt5_user_data[username].get("insufficient_funds_notification_sent"):
-                try:
+        # Process each symbol
+        for symbol in mt5_user_data[username].get("active_symbols", FOREX_SYMBOLS):
+            if mt5_user_data[username]["bot_status"] != "Running":
+                break
+
+            try:
+                await asyncio.sleep(SLEEP_BETWEEN_SYMBOLS)
+
+                # Manage any existing positions for this symbol first.
+                for ticket, _ in _get_positions_for_symbol(username, symbol):
+                    await manage_mt5_position(username, ticket, bot, telegram_id, ctx)
+
+                # Skip if at max trades
+                if active_count >= MAX_CONCURRENT_TRADES:
+                    continue
+
+                # Analyze for new entry
+                bid, ask = await get_current_price(ctx, symbol)
+                if bid is None:
+                    print(f"[MT5-LOOP] ⏭️ Skipping {symbol} — symbol not available on this account")
+                    continue
+
+                sym_info = await get_symbol_info(ctx, symbol)
+                if sym_info is None:
+                    print(f"[MT5-LOOP] ⏭️ Skipping {symbol} — cannot retrieve symbol info")
+                    continue
+
+                support = await find_support_level_mt5(ctx, symbol)
+                resistance = await find_resistance_level_mt5(ctx, symbol)
+
+                if support is None or resistance is None:
+                    print(f"[MT5-LOOP] ⏭️ Skipping {symbol} — cannot calculate support/resistance")
+                    continue
+
+                gap_pct = (resistance - support) / support
+                if gap_pct < 0.0005:
+                    continue
+
+                signal, details = await get_trade_signal_mt5(ctx, symbol, bid, support, resistance)
+
+                k = details.get('stoch_rsi_k', '-')
+                d = details.get('stoch_rsi_d', '-')
+                crossover = details.get('crossover', '-')
+                score = details.get('score', '-')
+                reasons = details.get('reasons', [])
+                price_pos = details.get('price_position', None)
+                print(f"[MT5-LOOP] {symbol} @ {bid:.5f} | StochRSI K={k}, D={d}, {crossover} | Signal={signal} | Score={score}")
+                if reasons:
+                    print(f"[MT5-LOOP]   Reasons: {' | '.join(str(r) for r in reasons)}")
+                if price_pos is not None:
+                    print(f"[MT5-LOOP]   Price position in S/R range: {price_pos*100:.1f}% | Support={support:.5f} | Resistance={resistance:.5f} | Bid={bid:.5f}")
+
+                if signal == "NO_TRADE":
+                    continue
+
+                if _has_symbol_direction(username, symbol, signal):
+                    print(f"[MT5-LOOP] ⏭️ Skipping {symbol} {signal} — same direction already open")
+                    continue
+
+                # ===== LOW BALANCE GUARD =====
+                # Refresh balance before every trade attempt (it may have changed)
+                balance = await get_account_balance(ctx)
+                if balance < MT5_MIN_BALANCE_TO_TRADE:
+                    print(f"[MT5-LOOP] ⚠️ Balance too low to trade: ${balance:.2f} < ${MT5_MIN_BALANCE_TO_TRADE} minimum")
+                    if not mt5_user_data[username].get('low_balance_notification_sent', False):
+                        try:
+                            bot.send_message(
+                                chat_id=telegram_id,
+                                text=f"⚠️ <b>Balance Too Low to Trade</b>\n"
+                                     f"━━━━━━━━━━━━━━━━━\n\n"
+                                     f"💰 <b>Current Balance:</b> <code>${balance:.2f}</code>\n"
+                                     f"🔒 <b>Minimum Required:</b> <code>${MT5_MIN_BALANCE_TO_TRADE:.2f}</code>\n\n"
+                                     f"🛑 Trading is paused to protect your account.\n\n"
+                                     f"💡 <i>Please top up your broker account to resume trading.</i>",
+                                parse_mode='HTML'
+                            )
+                            mt5_user_data[username]['low_balance_notification_sent'] = True
+                        except Exception as _e:
+                            print(f"[MT5-LOOP] ⚠️ Failed to send low-balance notification: {_e}")
+                    continue
+                else:
+                    # Reset the notification flag when balance recovers
+                    mt5_user_data[username]['low_balance_notification_sent'] = False
+
+                # Get balance-based parameters for lot size and pip ranges
+                # Note: balance was already fetched freshly in the low-balance guard above
+                balance_params = get_mt5_balance_based_params(balance)
+                lot_size = balance_params["lot"]
+                tp_pips = balance_params["tp_pips"]
+                sl_pips = balance_params["sl_pips"]
+
+                # Calculate SL/TP with balance-based pip values
+                price = ask if signal == "BUY" else bid
+                digits = sym_info["digits"]
+
+                sl, tp = _calculate_mt5_sl_tp(symbol, signal, price, sym_info, tp_pips=tp_pips, sl_pips=sl_pips)
+
+                print(f"[MT5-LOOP] 💰 Balance=${balance:.2f} | Balance tier: Lot={lot_size}, TP={tp_pips}pip, SL={sl_pips}pip")
+                print(f"[MT5-LOOP] 📋 Order details: {signal} {symbol} | Lot={lot_size} | Entry~{price:.5f} | SL={sl:.5f} | TP={tp:.5f} | Digits={digits}")
+                print(f"[MT5-LOOP]   SL distance: {abs(price - sl):.5f} ({sl_pips} pips) | TP distance: {abs(tp - price):.5f} ({tp_pips} pips)")
+
+                # ===== PRE-TRADE CRASH SAFETY CHECK (Gold drawdown — same as main loop) =====
+                crash_ref = _mt5_crash_reference_symbol(username)
+                is_safe_to_trade, safety_reason = await mt5_crash_protector.is_safe_to_open_position(
+                    ctx, reference_symbol=crash_ref
+                )
+                if not is_safe_to_trade:
+                    print(f"[MT5-LOOP] ⚠️ TRADE BLOCKED for {symbol}: {safety_reason}")
+                    continue
+
+                # Place order via MetaAPI with retry logic
+                comment = f"StochRSI {signal}"
+                result, is_success, error_msg = await open_position_with_retry(
+                    ctx, symbol, signal, lot_size, sl, tp, comment, 
+                    max_retries=3, backoff_seconds=2
+                )
+
+                print(f"[MT5-LOOP] 📬 Order result: success={is_success} | error={error_msg} | raw={result}")
+
+                if result is not None and is_success:
+                    position_id = _normalize_ticket(result.get('positionId', result.get('orderId', '')))
+                    open_price = result.get('openPrice', result.get('price', price))
+
+                    # Verify fill price from broker — MetaAPI result does not always
+                    # include the actual execution price; reading the open position
+                    # gives the true broker fill price and avoids slippage mismatch.
+                    try:
+                        await asyncio.sleep(1)
+                        live_positions = await get_open_positions(ctx, magic_only=False)
+                        for lp in live_positions:
+                            if _normalize_ticket(lp.get('ticket')) == position_id:
+                                broker_fill = lp.get('price_open', 0)
+                                if broker_fill and broker_fill > 0:
+                                    if abs(broker_fill - open_price) > 0.0001:
+                                        print(f"[MT5-LOOP] 📌 Fill price corrected: {open_price:.5f} → {broker_fill:.5f}")
+                                    open_price = broker_fill
+                                break
+                    except Exception as _ep:
+                        print(f"[MT5-LOOP] ⚠️ Could not verify fill price: {_ep}")
+
+                    print(f"[MT5-LOOP] ✅ Opened {signal} {symbol} @ {open_price:.5f} | Ticket={position_id}")
+                    mt5_user_data[username]["positions"][position_id] = {
+                        "ticket": position_id,
+                        "symbol": symbol,
+                        "direction": signal,
+                        "entry": open_price,
+                        "opened_balance": balance,
+                        "sl": sl,
+                        "tp": tp,
+                        "volume": lot_size,
+                        "highest_profit_pct": 0.0,
+                        "breakeven_set": False,
+                        "trailing_active": False,
+                    }
+                    active_count += 1
+
+                    # Send Telegram notification
+                    emoji = "🚀" if signal == "BUY" else "🔻"
                     bot.send_message(
-                        telegram_id,
-                        f"⛔ <b>Insufficient Funds</b>\n"
-                        f"Balance: ${balance:.2f}\n"
-                        f"Minimum required: ${MT5_MIN_BALANCE_TO_TRADE:.2f}\n\n"
-                        f"Deposit funds to resume trading.",
-                        parse_mode="HTML"
+                        chat_id=telegram_id,
+                        text=f"<b>{emoji} {signal} Position Opened (MT5)</b>\n"
+                             f"━━━━━━━━━━━━━━━━━\n\n"
+                             f"💱 <b>Pair:</b> <code>{symbol}</code>\n"
+                             f"📈 <b>Entry:</b> <code>{open_price:.5f}</code>\n"
+                             f"🎯 <b>TP:</b> <code>{tp:.5f}</code>\n"
+                             f"🛑 <b>SL:</b> <code>{sl:.5f}</code>\n"
+                             f"📊 <b>Lot:</b> <code>{lot_size}</code>\n"
+                             f"📈 <b>Balance:</b> <code>${balance:.2f}</code>\n"
+                             f"🔢 <b>Active:</b> {active_count}/{MAX_CONCURRENT_TRADES}",
+                        parse_mode='HTML'
                     )
-                    mt5_user_data[username]["insufficient_funds_notification_sent"] = True
-                except Exception as e:
-                    print(f"[MT5-LOOP] ⚠️ Error sending insufficient funds notification: {e}")
-            await asyncio.sleep(30)
-            continue
+                    mt5_crash_protector.record_trade(telegram_id)
+                elif error_msg:
+                    print(f"[MT5-LOOP] ❌ Order failed for {symbol}: {error_msg}")
+                    
+                    # Detect market closed and notify user once
+                    if "market is closed" in error_msg.lower() and not mt5_user_data[username].get('market_closed_notification_sent', False):
+                        try:
+                            bot.send_message(
+                                chat_id=telegram_id,
+                                text=f"<b>🚫 FOREX MARKET CLOSED</b>\n"
+                                     f"━━━━━━━━━━━━━━━━━\n\n"
+                                     f"📅 <b>Status:</b> Market is closed\n\n"
+                                     f"⏰ <i>Waiting for market to open...</i>\n\n"
+                                     f"ℹ️ <i>Bot will resume trading when market reopens.</i>",
+                                parse_mode='HTML'
+                            )
+                            mt5_user_data[username]['market_closed_notification_sent'] = True
+                        except Exception as e:
+                            print(f"[MT5-LOOP] ⚠️ Failed to send market closed notification: {e}")
 
-        # === MAIN TRADING LOGIC (PLACEHOLDER FOR NOW) ===
-        try:
-            # TODO: Implement signal analysis and trading logic
-            # For now, just maintain the connection and send updates
-            pass
-        except Exception as e:
-            print(f"[MT5-LOOP] ⚠️ Trading logic error: {e}")
+                    # Detect insufficient funds and notify user once
+                    if "not enough money" in error_msg.lower() and not mt5_user_data[username].get('insufficient_funds_notification_sent', False):
+                        try:
+                            bot.send_message(
+                                chat_id=telegram_id,
+                                text=f"<b>⚠️ INSUFFICIENT FUNDS</b>\n"
+                                     f"━━━━━━━━━━━━━━━━━\n\n"
+                                     f"❌ <b>Trade Rejected:</b> Not enough money to open position.\n"
+                                     f"💱 <b>Pair:</b> {symbol}\n\n"
+                                     f"Please top up your broker account to resume trading.",
+                                parse_mode='HTML'
+                            )
+                            mt5_user_data[username]['insufficient_funds_notification_sent'] = True
+                        except Exception as e:
+                            print(f"[MT5-LOOP] ⚠️ Failed to send insufficient funds notification: {e}")
 
-        # Sleep before next iteration
+            except Exception as e:
+                print(f"[MT5-LOOP] ❌ Error processing {symbol}: {e}")
+
+        print(f"[MT5-LOOP] 😴 Sleeping {SCAN_INTERVAL_SECONDS}s...")
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
     print(f"[MT5-LOOP] 🛑 Exiting trade loop for {username}")
 
 
-# ===== HELPER FUNCTIONS FOR FUTURE IMPLEMENTATION =====
-# These functions are placeholders for when signal analysis and trading are fully implemented
+async def sync_mt5_positions(username, ctx, bot=None, telegram_id=None):
+    """Sync internal state with actual MetaAPI positions"""
+    open_pos = await get_open_positions(ctx, magic_only=True)
+    open_tickets = {_normalize_ticket(p["ticket"]): p for p in open_pos}
 
-async def sync_mt5_positions(username, ctx=None, bot=None, telegram_id=None):
-    """Sync internal position tracking with actual open positions from broker"""
-    conn = get_mt5_connection()
-    if not conn.is_connected():
-        return
-    
-    try:
-        # Get all open positions from broker
-        open_positions = conn.get_positions()
-        if open_positions is None:
-            open_positions = []
-        
-        open_tickets = {str(p['ticket']): p for p in open_positions}
-        
-        # Check for closed positions and remove from tracking
-        for ticket in list(mt5_user_data[username]["positions"].keys()):
-            if ticket not in open_tickets:
-                pos = mt5_user_data[username]["positions"][ticket]
-                symbol = pos.get("symbol", "Unknown")
-                direction = pos.get("direction", "Unknown")
-                entry_price = pos.get("entry", 0)
-                
-                print(f"[MT5-SYNC] Position closed: {symbol} {direction} | Ticket={ticket}")
-                
-                # Try to get P&L from closed position
+    # Update last-known broker profit for every STILL-OPEN position.
+    # The 'profit' field from get_open_positions is the broker's live P&L
+    # (includes swap + commission). We snapshot it every cycle so that if
+    # deal history is unavailable at close time we still have real broker data.
+    for ticket, broker_pos in open_tickets.items():
+        if ticket in mt5_user_data[username].get("positions", {}):
+            mt5_user_data[username]["positions"][ticket]["last_broker_profit"] = broker_pos.get("profit")
+
+    # Remove closed positions
+    for ticket, pos in list(mt5_user_data[username]["positions"].items()):
+        if ticket not in open_tickets:
+            tracked_positions_before_close = len(mt5_user_data[username].get("positions", {}))
+            symbol = pos.get("symbol", "Unknown")
+            direction = pos.get("direction", "Unknown")
+            entry_price = pos.get("entry", 0)
+            volume = pos.get("volume", 0)
+
+            print(f"[MT5-SYNC] Position closed on broker | Ticket={ticket} | {symbol} {direction}")
+
+            realized_pnl = None
+            pnl_pct = 0.0
+            pnl_emoji = ""
+            pnl_source = ""
+
+            try:
+                # ── Priority 1: deal history (broker's exact realised P&L) ──────
+                for attempt in range(3):
+                    real_profit, _ = await get_position_realized_pnl(ctx, ticket)
+                    if real_profit is not None:
+                        realized_pnl = real_profit
+                        pnl_source = "Realized"
+                        print(f"[MT5-SYNC] ✅ Broker deal P&L for {ticket}: ${real_profit:.2f} (attempt {attempt+1})")
+                        break
+                    if attempt < 2:
+                        print(f"[MT5-SYNC] ⏳ Deal not yet in history, retrying ({attempt+1}/3)…")
+                        await asyncio.sleep(1.0)
+
+                # ── Priority 2: account balance delta (final realized result) ─────
+                # MT5 bot is configured for a single concurrent position, so when the
+                # last tracked position closes, balance delta is the most reliable
+                # broker-final fallback if history APIs lag or return partial data.
+                if realized_pnl is None:
+                    open_balance = pos.get("opened_balance")
+                    if (
+                        tracked_positions_before_close == 1
+                        and len(open_tickets) == 0
+                        and open_balance is not None
+                    ):
+                        current_balance = await get_account_balance(ctx)
+                        if current_balance and current_balance > 0:
+                            realized_pnl = float(current_balance) - float(open_balance)
+                            pnl_source = "Balance Delta"
+                            print(
+                                f"[MT5-SYNC] 💰 Using balance delta for {ticket}: "
+                                f"${realized_pnl:.2f} (current=${current_balance:.2f} - open=${float(open_balance):.2f})"
+                            )
+                        else:
+                            print(
+                                f"[MT5-SYNC] ⚠️ Skipping balance-delta fallback for {ticket} "
+                                f"because current_balance lookup failed: {current_balance!r}"
+                            )
+
+                # ── Priority 3: last live snapshot from open-position list ───────
+                if realized_pnl is None:
+                    last_snap = pos.get("last_broker_profit")
+                    if last_snap is not None:
+                        realized_pnl = float(last_snap)
+                        pnl_source = "Snapshot"
+                        print(f"[MT5-SYNC] 📸 Using last broker profit snapshot for {ticket}: ${realized_pnl:.2f}")
+
+                print(f"[MT5-SYNC] Final P&L decision: {realized_pnl!r} via {pnl_source!r}")
+
+                # ── Derive percentage from real P&L (no price calculation) ───────
+                if realized_pnl is not None and entry_price > 0 and volume > 0:
+                    sym_upper = symbol.upper()
+                    if "XAU" in sym_upper or "GOLD" in sym_upper:
+                        price_diff = realized_pnl / (100.0 * volume)
+                    elif "JPY" in sym_upper:
+                        price_diff = realized_pnl / (1000.0 * volume)
+                    else:
+                        price_diff = realized_pnl / (100000.0 * volume)
+
+                    if direction == "BUY":
+                        pnl_pct = (price_diff / entry_price) * 100
+                    else:
+                        pnl_pct = (-price_diff / entry_price) * 100
+
+                    pnl_emoji = "🟢" if realized_pnl >= 0 else "🔴"
+
+            except Exception as e:
+                print(f"[MT5-SYNC] ⚠️ Could not retrieve P&L: {e}")
+
+            del mt5_user_data[username]["positions"][ticket]
+            if bot and telegram_id:
                 try:
-                    # Recent closed deals info would normally come from deal history
-                    # For now, just log that position is closed
-                    print(f"[MT5-SYNC] ℹ️ {symbol} {direction} closed (entry: {entry_price:.5f})")
+                    message = f"ℹ️ <b>Position Closed on Broker</b>\n\n"
+                    message += f"💱 <b>Pair:</b> <code>{symbol}</code>\n"
+                    message += f"📌 <b>Side:</b> <code>{direction}</code>\n"
+                    message += f"🎫 <b>Ticket:</b> <code>{ticket}</code>\n"
+
+                    if realized_pnl is not None:
+                        pnl_sign = "+" if realized_pnl >= 0 else ""
+                        pct_str = f" ({pnl_sign}{pnl_pct:.2f}%)" if pnl_pct != 0.0 else ""
+                        message += f"\n{pnl_emoji} <b>P&L ({pnl_source}):</b> <code>{pnl_sign}${realized_pnl:.2f}{pct_str}</code>\n"
+                    else:
+                        message += f"\n⏳ <b>P&L:</b> <i>Pending from broker</i>\n"
+
+                    message += f"\n🔢 <b>Active:</b> {len(open_tickets)}/{MAX_CONCURRENT_TRADES}\n\n"
+                    message += f"<i>The bot will search for a new trade while a slot is free.</i>"
+
+                    bot.send_message(
+                        chat_id=telegram_id,
+                        text=message,
+                        parse_mode='HTML'
+                    )
                 except Exception as e:
-                    print(f"[MT5-SYNC] ⚠️ Could not retrieve P&L for {ticket}: {e}")
-                
-                # Remove from tracking
-                del mt5_user_data[username]["positions"][ticket]
-                
-                # Send notification
-                if bot and telegram_id:
-                    try:
-                        bot.send_message(
-                            chat_id=telegram_id,
-                            text=f"ℹ️ <b>Position Closed</b>\n\n"
-                                 f"💱 <b>Pair:</b> <code>{symbol}</code>\n"
-                                 f"📌 <b>Side:</b> <code>{direction}</code>\n"
-                                 f"🎫 <b>Ticket:</b> <code>{ticket}</code>\n\n"
-                                 f"✅ Position has been closed.",
-                            parse_mode='HTML'
-                        )
-                    except Exception as e:
-                        print(f"[MT5-SYNC] ⚠️ Failed to send close notification: {e}")
-        
-        # Check for new externally-opened positions (opened outside bot)
-        for ticket, broker_pos in open_tickets.items():
-            if ticket not in mt5_user_data[username]["positions"]:
-                mt5_user_data[username]["positions"][ticket] = {
-                    "ticket": ticket,
-                    "symbol": broker_pos.get("symbol", "Unknown"),
-                    "direction": broker_pos.get("type", "BUY"),
-                    "entry": broker_pos.get("price_open", 0),
-                    "sl": broker_pos.get("sl", 0),
-                    "tp": broker_pos.get("tp", 0),
-                    "volume": broker_pos.get("volume", 0),
-                    "highest_profit_pct": 0.0,
-                    "breakeven_set": False,
-                    "trailing_active": False,
-                }
-                print(f"[MT5-SYNC] 📥 Loaded external position: {broker_pos.get('symbol')} {broker_pos.get('type')} | Ticket={ticket}")
-                
-    except Exception as e:
-        print(f"[MT5-SYNC] ❌ Error syncing positions: {e}")
+                    print(f"[MT5-SYNC] ⚠️ Failed to send close notification: {e}")
+
+    # Add externally opened positions
+    for ticket, p in open_tickets.items():
+        if ticket not in mt5_user_data[username]["positions"]:
+            mt5_user_data[username]["positions"][ticket] = {
+                "ticket": ticket,
+                "symbol": p["symbol"],
+                "direction": p["type"],
+                "entry": p["price_open"],
+                "sl": p["sl"],
+                "tp": p["tp"],
+                "volume": p["volume"],
+                "highest_profit_pct": 0.0,
+                "breakeven_set": False,
+                "trailing_active": False,
+            }
+            print(f"[MT5-SYNC] Loaded existing {p['type']} for {p['symbol']} | Ticket={ticket}")
 
 
-async def manage_mt5_position(username, ticket, bot, telegram_id, ctx=None):
+async def manage_mt5_position(username, ticket, bot, telegram_id, ctx):
     """
-    Manage open position with breakeven and trailing stop logic using local MT5.
+    Manage open position with breakeven and trailing stop logic via MetaAPI.
     
-    - At BREAKEVEN_TRIGGER_PCT (20%): Move SL to entry price (breakeven)
+    - At BREAKEVEN_TRIGGER_PCT (20%): Move SL to entry (breakeven)
     - At TRAILING_TRIGGER_PCT (30%): Start trailing stop  
-    - Trailing: SL follows at peak_profit - TRAILING_STOP_PCT below peak
+    - Trailing: SL follows at TRAILING_STOP_PCT below peak profit
     """
-    conn = get_mt5_connection()
-    if not conn.is_connected():
-        return
-    
     pos = mt5_user_data[username]["positions"].get(ticket)
     if not pos:
         return
@@ -494,99 +805,94 @@ async def manage_mt5_position(username, ticket, bot, telegram_id, ctx=None):
     if not symbol:
         return
 
-    try:
-        # Get current price for the symbol using configured trading timeframe
-        candles = conn.get_candles(symbol, SIGNAL_TIMEFRAME, 1)
-        if not candles or len(candles) == 0:
-            return
-        
-        current_price = candles[-1]['close']
-        entry = pos["entry"]
-        direction = pos["direction"]
-        current_sl = pos["sl"]
+    bid, ask = await get_current_price(ctx, symbol)
+    if bid is None:
+        return
 
-        # Calculate current P/L percentage
+    entry = pos["entry"]
+    direction = pos["direction"]
+    current_sl = pos["sl"]
+
+    # Calculate current P/L percentage
+    if direction == "BUY":
+        current_price = bid
+        pnl_pct = ((current_price - entry) / entry) * 100
+    else:
+        current_price = ask
+        pnl_pct = ((entry - current_price) / entry) * 100
+
+    # Update highest profit tracking
+    if pnl_pct > pos.get("highest_profit_pct", 0):
+        pos["highest_profit_pct"] = pnl_pct
+
+    print(f"[MT5-MANAGE] {symbol} {direction} | Entry: {entry:.5f} | P/L: {pnl_pct:.2f}% | Peak: {pos.get('highest_profit_pct', 0):.2f}%")
+
+    # === BREAKEVEN LOGIC ===
+    if pnl_pct >= BREAKEVEN_TRIGGER_PCT and not pos.get("breakeven_set", False):
         if direction == "BUY":
-            pnl_pct = ((current_price - entry) / entry) * 100
+            new_sl = entry * 1.001  # Slightly above entry for spread
         else:
-            pnl_pct = ((entry - current_price) / entry) * 100
+            new_sl = entry * 0.999  # Slightly below entry for SELL
+        
+        result = await modify_position_sl(ctx, ticket, new_sl)
+        if result:
+            pos["sl"] = new_sl
+            pos["breakeven_set"] = True
+            print(f"[MT5-MANAGE] ✅ {symbol} BREAKEVEN SET | New SL: {new_sl:.5f}")
+            bot.send_message(
+                chat_id=telegram_id,
+                text=f"🔒 <b>Breakeven Set</b>\n\n"
+                     f"💱 <b>Pair:</b> <code>{symbol}</code>\n"
+                     f"📊 <b>Profit:</b> <code>{pnl_pct:.2f}%</code>\n"
+                     f"🛑 <b>New SL:</b> <code>{new_sl:.5f}</code>\n\n"
+                     f"<i>Stop loss moved to breakeven to protect capital.</i>",
+                parse_mode='HTML'
+            )
+        return
 
-        # Update highest profit tracking
-        if pnl_pct > pos.get("highest_profit_pct", 0):
-            pos["highest_profit_pct"] = pnl_pct
-
-        print(f"[MT5-MANAGE] {symbol} {direction} | Entry: {entry:.5f} | Current: {current_price:.5f} | P/L: {pnl_pct:.2f}% | Peak: {pos.get('highest_profit_pct', 0):.2f}%")
-
-        # === BREAKEVEN LOGIC ===
-        if pnl_pct >= BREAKEVEN_TRIGGER_PCT and not pos.get("breakeven_set", False):
-            if direction == "BUY":
-                new_sl = entry * 1.001  # Slightly above entry for spread
-            else:
-                new_sl = entry * 0.999  # Slightly below entry for SELL
-            
-            result = conn.modify_position(ticket, new_sl, pos.get("tp"))
-            if result:
-                pos["sl"] = new_sl
-                pos["breakeven_set"] = True
-                print(f"[MT5-MANAGE] ✅ {symbol} BREAKEVEN SET | New SL: {new_sl:.5f}")
-                try:
-                    bot.send_message(
-                        chat_id=telegram_id,
-                        text=f"🔒 <b>Breakeven Set</b>\n\n"
-                             f"💱 <b>Pair:</b> <code>{symbol}</code>\n"
-                             f"📊 <b>Profit:</b> <code>{pnl_pct:.2f}%</code>\n"
-                             f"🛑 <b>New SL:</b> <code>{new_sl:.5f}</code>\n\n"
-                             f"<i>Stop loss moved to breakeven to protect capital.</i>",
-                        parse_mode='HTML'
-                    )
-                except Exception as e:
-                    print(f"[MT5-MANAGE] ⚠️ Failed to send breakeven notification: {e}")
-            return
-
-        # === TRAILING STOP LOGIC ===
-        if pnl_pct >= TRAILING_TRIGGER_PCT:
-            pos["trailing_active"] = True
-            
-            # Calculate trailing stop based on peak profit
-            peak_profit_pct = pos["highest_profit_pct"]
-            locked_profit_pct = peak_profit_pct - TRAILING_STOP_PCT
-            
-            if direction == "BUY":
-                new_sl = entry * (1 + locked_profit_pct / 100)
-                if new_sl > current_sl:
-                    result = conn.modify_position(ticket, new_sl, pos.get("tp"))
-                    if result:
-                        pos["sl"] = new_sl
-                        print(f"[MT5-MANAGE] 📈 {symbol} TRAILING | New SL: {new_sl:.5f} | Locking {locked_profit_pct:.1f}% profit")
-            else:  # SELL
-                new_sl = entry * (1 - locked_profit_pct / 100)
-                if new_sl < current_sl:
-                    result = conn.modify_position(ticket, new_sl, pos.get("tp"))
-                    if result:
-                        pos["sl"] = new_sl
-                        print(f"[MT5-MANAGE] 📉 {symbol} TRAILING | New SL: {new_sl:.5f} | Locking {locked_profit_pct:.1f}% profit")
-
-    except Exception as e:
-        print(f"[MT5-MANAGE] ❌ Error managing {ticket}: {e}")
+    # === TRAILING STOP LOGIC ===
+    if pnl_pct >= TRAILING_TRIGGER_PCT:
+        pos["trailing_active"] = True
+        
+        # Calculate trailing stop based on peak profit
+        locked_profit_pct = pos["highest_profit_pct"] - TRAILING_STOP_PCT
+        
+        if direction == "BUY":
+            new_sl = entry * (1 + locked_profit_pct / 100)
+            if new_sl > pos["sl"]:
+                result = await modify_position_sl(ctx, ticket, new_sl)
+                if result:
+                    pos["sl"] = new_sl
+                    print(f"[MT5-MANAGE] 📈 {symbol} TRAILING | New SL: {new_sl:.5f} | Locking {locked_profit_pct:.1f}%")
+        else:
+            new_sl = entry * (1 - locked_profit_pct / 100)
+            if new_sl < pos["sl"]:
+                result = await modify_position_sl(ctx, ticket, new_sl)
+                if result:
+                    pos["sl"] = new_sl
+                    print(f"[MT5-MANAGE] 📉 {symbol} TRAILING | New SL: {new_sl:.5f} | Locking {locked_profit_pct:.1f}%")
 
 
 async def get_mt5_balance_async(telegram_id):
-    """Get MT5 account balance from local terminal (async)"""
-    conn = get_mt5_connection()
-    if not conn.is_connected():
+    """Get MT5 account balance for a user via MetaAPI (async)"""
+    username_key = f"user_{telegram_id}"
+    if username_key not in mt5_user_data:
+        return None
+    ctx = mt5_user_data[username_key].get("ctx")
+    if ctx is None:
         return None
     try:
-        return conn.get_balance()
+        return await get_account_balance(ctx)
     except Exception:
         return None
 
 
 def get_mt5_balance():
     """Get MT5 account balance — sync wrapper for backward compatibility."""
-    conn = get_mt5_connection()
-    if not conn.is_connected():
-        return None
-    return conn.get_balance()
+    # NOTE: This is a legacy sync function.
+    # When MT5 is running, balance is available from the cached session data.
+    # For async callers, use get_mt5_balance_async() instead.
+    return None
 
 
 def get_mt5_trading_status(username_key):
@@ -598,7 +904,7 @@ def get_mt5_trading_status(username_key):
         "status": mt5_user_data[username_key].get("bot_status", "Unknown"),
         "trading_mode": mt5_user_data[username_key].get("trading_mode"),
         "active_trades": len(mt5_user_data[username_key].get("positions", {})),
-        "balance": get_mt5_balance(),
+        "balance": None,  # Use async version to get real-time balance
     }
 
 
@@ -607,21 +913,19 @@ async def get_detailed_mt5_status_async(username_key):
     if username_key not in mt5_user_data:
         return None
 
-    conn = get_mt5_connection()
-    if not conn.is_connected():
+    ctx = mt5_user_data[username_key].get("ctx")
+    if ctx is None:
         return get_mt5_trading_status(username_key)
 
     try:
-        # Get full account info from local MT5
-        account_info = conn.get_account_info()
-        if not account_info:
-            return get_mt5_trading_status(username_key)
+        # Get full account info via MetaAPI
+        account_info = await get_account_info(ctx)
 
         balance = account_info.get('balance', 0)
         equity = account_info.get('equity', 0)
         margin = account_info.get('margin', 0)
-        free_margin = account_info.get('margin_free', 0)
-        unrealized_pnl = equity - balance
+        free_margin = account_info.get('free_margin', 0)
+        unrealized_pnl = account_info.get('profit', 0)
         leverage = account_info.get('leverage', 0)
         currency = account_info.get('currency', 'USD')
 
@@ -631,17 +935,15 @@ async def get_detailed_mt5_status_async(username_key):
         else:
             pnl_percentage = 0
 
-        # Get open positions
-        positions = conn.get_positions()
-        if positions is None:
-            positions = []
+        # Get open positions with details
+        open_positions = await get_open_positions(ctx, magic_only=True)
 
         positions_detail = []
-        for pos in positions:
+        for pos in open_positions:
             entry_price = pos.get('price_open', 0)
             current_price = pos.get('price_current', 0)
             pos_profit = pos.get('profit', 0)
-            pos_type = pos.get('type', 'BUY')
+            pos_type = pos.get('type', 'Unknown')
 
             # Calculate position PnL %
             if entry_price > 0:
@@ -663,7 +965,7 @@ async def get_detailed_mt5_status_async(username_key):
                 "tp": pos.get('tp', 0),
                 "profit": pos_profit,
                 "pnl_percentage": pos_pnl_pct,
-                "time": pos.get('time_open'),
+                "time": pos.get('time'),
             })
 
         return {

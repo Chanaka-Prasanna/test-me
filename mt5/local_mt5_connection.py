@@ -186,6 +186,17 @@ class MT5Connection:
             return None
         
         try:
+            # First, ensure the symbol is selected on the MT5 terminal
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                print(f"[MT5-CONN] Symbol {symbol} not found on broker")
+                return None
+            
+            if not symbol_info.visible:
+                if not mt5.symbol_select(symbol, True):
+                    print(f"[MT5-CONN] Cannot select symbol {symbol} for candle retrieval")
+                    return None
+            
             # Convert timeframe string to MT5 constant
             tf_map = {
                 "M1": mt5.TIMEFRAME_M1,
@@ -480,6 +491,172 @@ class MT5Connection:
         except Exception as e:
             print(f"[MT5-CONN] Error modifying position: {e}")
             return False
+    
+    def get_symbol_specification(self, symbol: str) -> Optional[Dict]:
+        """
+        Get symbol specification (point, digits, contract size, etc.)
+        
+        Args:
+            symbol: Symbol name (e.g., "XAUUSD")
+        
+        Returns:
+            Dictionary with symbol info, or None if error
+        """
+        if not self.is_connected():
+            return None
+        
+        try:
+            # Get symbol info from MT5
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                print(f"[MT5-CONN] Symbol not found: {symbol}")
+                # Try selecting it first, then get info again
+                if not mt5.symbol_select(symbol, True):
+                    print(f"[MT5-CONN] Cannot select symbol {symbol}")
+                    return None
+                symbol_info = mt5.symbol_info(symbol)
+                if symbol_info is None:
+                    print(f"[MT5-CONN] Symbol still not available after selection: {symbol}")
+                    return None
+            
+            # Convert to dict format compatible with rest of code
+            return {
+                "symbol": symbol_info.name,
+                "point": float(symbol_info.point),
+                "digits": int(symbol_info.digits),
+                "spread": int(symbol_info.spread),
+                "minVolume": float(symbol_info.volume_min),
+                "maxVolume": float(symbol_info.volume_max),
+                "volumeStep": float(symbol_info.volume_step),
+                "contractSize": float(symbol_info.trade_contract_size),
+                "bid": float(symbol_info.bid),
+                "ask": float(symbol_info.ask),
+            }
+        except Exception as e:
+            print(f"[MT5-CONN] Error getting symbol specification for {symbol}: {e}")
+            return None
+    
+    def symbol_info(self, symbol: str) -> Optional[Dict]:
+        """
+        Alias for get_symbol_specification() for backward compatibility.
+        Returns full symbol information including bid/ask prices.
+        """
+        return self.get_symbol_specification(symbol)
+    
+    def get_symbol_price(self, symbol: str) -> Optional[Dict]:
+        """
+        Get current bid/ask prices for a symbol
+        
+        Args:
+            symbol: Symbol name (e.g., "XAUUSD")
+        
+        Returns:
+            Dictionary with bid/ask, or None if error
+        """
+        if not self.is_connected():
+            return None
+        
+        try:
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                return None
+            
+            return {
+                "bid": float(symbol_info.bid),
+                "ask": float(symbol_info.ask),
+            }
+        except Exception as e:
+            print(f"[MT5-CONN] Error getting price for {symbol}: {e}")
+            return None
+    
+    def get_account_information(self) -> Optional[Dict]:
+        """
+        Get full account information (wrapper for compatibility)
+        
+        Returns:
+            Dictionary with account info, or None if error
+        """
+        return self.get_account_info()
+    
+    def create_market_buy_order(self, symbol: str, volume: float, sl: Optional[float] = None, tp: Optional[float] = None, comment: str = "") -> Optional[Dict]:
+        """
+        Create a market buy order (wrapper for compatibility with MetaAPI interface)
+        
+        Args:
+            symbol: Symbol to trade
+            volume: Trade volume (in lots)
+            sl: Stop loss price
+            tp: Take profit price
+            comment: Order comment
+        
+        Returns:
+            Dictionary with order result or None
+        """
+        try:
+            # Get current ask price for market BUY
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                return None
+            
+            ask_price = float(symbol_info.ask)
+            
+            ticket = self.open_position(
+                symbol=symbol,
+                order_type="BUY",
+                volume=volume,
+                price=ask_price,  # Use current ask for market buy
+                sl=sl,
+                tp=tp,
+                comment=comment,
+                magic=0,
+                deviation=20
+            )
+            if ticket:
+                return {"ticket": ticket, "orderId": ticket}
+            return None
+        except Exception as e:
+            print(f"[MT5-CONN] Error creating buy order: {e}")
+            return None
+    
+    def create_market_sell_order(self, symbol: str, volume: float, sl: Optional[float] = None, tp: Optional[float] = None, comment: str = "") -> Optional[Dict]:
+        """
+        Create a market sell order (wrapper for compatibility with MetaAPI interface)
+        
+        Args:
+            symbol: Symbol to trade
+            volume: Trade volume (in lots)
+            sl: Stop loss price
+            tp: Take profit price
+            comment: Order comment
+        
+        Returns:
+            Dictionary with order result or None
+        """
+        try:
+            # Get current bid price for market SELL
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info is None:
+                return None
+            
+            bid_price = float(symbol_info.bid)
+            
+            ticket = self.open_position(
+                symbol=symbol,
+                order_type="SELL",
+                volume=volume,
+                price=bid_price,  # Use current bid for market sell
+                sl=sl,
+                tp=tp,
+                comment=comment,
+                magic=0,
+                deviation=20
+            )
+            if ticket:
+                return {"ticket": ticket, "orderId": ticket}
+            return None
+        except Exception as e:
+            print(f"[MT5-CONN] Error creating sell order: {e}")
+            return None
 
 
 # Global connection instance
